@@ -1,87 +1,91 @@
-package iran_resolver
+package blacklist_watcher
 
 import (
-	"bufio"
 	"github.com/coredns/caddy"
 	"github.com/coredns/caddy/caddyfile"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
+	"github.com/miekg/dns"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"net"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
-func init() { plugin.Register("iran_resolver", setup) }
+func init() { plugin.Register("blacklist_watcher", setup) }
 
-// setup is the function that gets called when the config parser see the token "iran_resolver".
+// setup is the function that gets called when the config parser see the token "blacklist_watcher".
 func setup(c *caddy.Controller) error {
-	ir, err := parseIR(c)
+	bw, err := parseBW(c)
 	if err != nil {
-		return plugin.Error("iran_resolver", err)
+		return plugin.Error("blacklist_watcher", err)
 	}
 
-	// init files
-	err = initHostFile(ir.banHostsFile, "hosts file witch contains ban domains:")
-	if err != nil {
-		return plugin.Error("iran_resolver", err)
-	}
-	err = initHostFile(ir.sanctionHostsFile, "hosts file witch contains sanction domains:")
-	if err != nil {
-		return plugin.Error("iran_resolver", err)
-	}
-	err = initHostFile(ir.resultHostsFile, "")
-	if err != nil {
-		return plugin.Error("iran_resolver", err)
+	// check postgres configs
+	if len(bw.pgHost) < 1 || len(bw.pgUser) < 1 || len(bw.pgPassword) < 1 || len(bw.pgDB) < 1 {
+		return plugin.Error("blacklist_watcher", errors.New("pg-host & pg-user & pg-db are required!"))
 	}
 
-	err = updateHostsFileWithIps(ir.sanctionHostsFile, ir.sanctionDestServers)
-	if err != nil {
-		return plugin.Error("iran_resolver", err)
-	}
-	err = updateHostsFileWithIps(ir.banHostsFile, ir.banDestServers)
-	if err != nil {
-		return plugin.Error("iran_resolver", err)
-	}
-	err = mergeHostsFiles(ir.sanctionHostsFile, ir.banHostsFile, ir.resultHostsFile)
-	if err != nil {
-		return plugin.Error("iran_resolver", err)
+	if bw.pgSSL {
+		if len(bw.pgSSLMode) < 1 {
+			return plugin.Error("blacklist_watcher", errors.New("pg-ssl-mode is required when pg-ssl is enabled!"))
+		}
+		if bw.pgSSLMode != "disable" && bw.pgSSLMode != "require" && bw.pgSSLMode != "verify-ca" && bw.pgSSLMode != "verify-full" {
+			return plugin.Error("blacklist_watcher", errors.New("pg-ssl-mode must be one of disable, require, verify-ca, verify-full!"))
+		}
+		if (bw.pgSSLMode == "verify-ca" || bw.pgSSLMode == "verify-full") && len(bw.pgSSLRootCert) < 1 {
+			return plugin.Error("blacklist_watcher", errors.New("pg-ssl-root-cert is required when pg-ssl-mode is verify-ca or verify-full!"))
+		}
 	}
 
 	// check required params
-	if len(ir.banDestServers) < 1 || len(ir.sanctionDestServers) < 1 || len(ir.dns2check) < 1 {
-		return plugin.Error("iran_resolver", errors.New("dns-to-check & sanction-dest-server-ips & ban-dest-server-ips are required!"))
+	if len(bw.pgHost) < 1 || len(bw.pgUser) < 1 || len(bw.dns2check) < 1 {
+		return plugin.Error("blacklist_watcher", errors.New("dns-to-check is required!"))
 	}
 
 	c.OnStartup(func() error {
-		return ir.OnStartup()
+		return bw.OnStartup()
 	})
-	c.OnShutdown(ir.OnShutdown)
+	c.OnShutdown(bw.OnShutdown)
 
 	// Add the Plugin to CoreDNS, so Servers can use it in their plugin chain.
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		ir.Next = next
-		return ir
+		bw.Next = next
+		return bw
 	})
 
 	return nil
 }
 
 // OnStartup starts a goroutines for all clients.
-func (ir *IranResolver) OnStartup() (err error) {
+func (bw *BlacklistWatcher) OnStartup() (err error) {
+	// Initialize database connection
+	err = bw.initDBConnection()
+	if err != nil {
+		bw.logger.WithError(err).Error("Failed to initialize database connection")
+		return err
+	}
 	return nil
 }
 
 // OnShutdown stops all configured clients.
-func (ir *IranResolver) OnShutdown() error {
+func (bw *BlacklistWatcher) OnShutdown() error {
+	// Close database connection
+	err := bw.closeDBConnection()
+	if err != nil {
+		bw.logger.WithError(err).Error("Failed to close database connection")
+		return err
+	}
+	bw.logger.Info("Database connection closed")
 	return nil
 }
 
-func parseIR(c *caddy.Controller) (*IranResolver, error) {
+func parseBW(c *caddy.Controller) (*BlacklistWatcher, error) {
 	var (
-		ir  *IranResolver
+		bw  *BlacklistWatcher
 		err error
 		i   int
 	)
@@ -90,181 +94,314 @@ func parseIR(c *caddy.Controller) (*IranResolver, error) {
 			return nil, plugin.ErrOnce
 		}
 		i++
-		ir, err = parseStanza(&c.Dispenser)
+		bw, err = parseStanza(&c.Dispenser)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return ir, nil
+	return bw, nil
 }
 
-func parseStanza(c *caddyfile.Dispenser) (*IranResolver, error) {
-	ir := New()
+func parseStanza(c *caddyfile.Dispenser) (*BlacklistWatcher, error) {
+	bw := New()
 
 	for c.NextBlock() {
-		err := parseValue(strings.ToLower(c.Val()), ir, c)
+		err := parseValue(strings.ToLower(c.Val()), bw, c)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return ir, nil
+	return bw, nil
 }
 
-func parseValue(v string, ir *IranResolver, c *caddyfile.Dispenser) error {
+func parseValue(v string, bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 	switch v {
 	case "dns-to-check":
-		return parseDns2Check(ir, c)
+		return parseDns2Check(bw, c)
+	case "dns-timeout":
+		return parseDnsTimeout(bw, c)
 	case "sanction-search":
-		return parseSanctionSearch(ir, c)
+		return parseSanctionSearch(bw, c)
 	case "ban-search":
-		return parseBanSearch(ir, c)
-	case "sanction-hosts-file":
-		return parseSanctionHostsFile(ir, c)
-	case "ban-hosts-file":
-		return parseBanHostsFile(ir, c)
-	case "result-hosts-file":
-		return parseResultHostsFile(ir, c)
-	case "sanction-dest-server-ips":
-		return parseSanctionDestServers(ir, c)
-	case "ban-dest-server-ips":
-		return parseBanDestServers(ir, c)
+		return parseBanSearch(bw, c)
+	case "pg-host":
+		return parsePgHost(bw, c)
+	case "pg-port":
+		return parsePgPort(bw, c)
+	case "pg-user":
+		return parsePgUser(bw, c)
+	case "pg-password":
+		return parsePgPassword(bw, c)
+	case "pg-db":
+		return parsePgDB(bw, c)
+	case "pg-schema":
+		return parsePgSchema(bw, c)
+	case "pg-ssl":
+		return parsePgSSL(bw, c)
+	case "pg-ssl-mode":
+		return parsePgSSLMode(bw, c)
+	case "pg-ssl-root-cert":
+		return parsePgSSLRootCert(bw, c)
+	case "additional-tags":
+		return parseAdditionalTags(bw, c)
+	case "ban-tag":
+		return parseBanTag(bw, c)
+	case "sanction-tag":
+		return parseSanctionTag(bw, c)
 	case "sanction-buffer-size":
-		return parseSanctionListBufferSize(ir, c)
+		return parseSanctionListBufferSize(bw, c)
 	case "ban-buffer-size":
-		return parseBanListBufferSize(ir, c)
+		return parseBanListBufferSize(bw, c)
+	case "log-level":
+		return parseLogLevel(bw, c)
 	default:
 		return errors.Errorf("unknown property %v", v)
 	}
 }
 
-func parseDns2Check(ir *IranResolver, c *caddyfile.Dispenser) error {
+func parseDns2Check(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 	args := c.RemainingArgs()
 	if len(args) == 0 {
-		return c.ArgErr()
+		return errors.New("dns-to-check requires at least one DNS server address")
 	}
 
 	for _, arg := range args {
+		if arg == "" {
+			return errors.New("dns-to-check: empty DNS server address")
+		}
 		ip, err := net.ResolveUDPAddr("udp", arg)
 		if err != nil {
-			return c.ArgErr()
+			return errors.Errorf("dns-to-check: invalid DNS server address '%s': %v", arg, err)
 		}
-		ir.dns2check = append(ir.dns2check, ip)
+		bw.dns2check = append(bw.dns2check, ip)
 	}
 	return nil
 }
 
-func parseSanctionSearch(ir *IranResolver, c *caddyfile.Dispenser) error {
-	args := c.RemainingArgs()
-	if len(args) == 0 {
-		return c.ArgErr()
-	}
-
-	for _, arg := range args {
-		ir.sanctionSearchParams = append(ir.sanctionSearchParams, arg)
-	}
-	return nil
-}
-
-func parseBanSearch(ir *IranResolver, c *caddyfile.Dispenser) error {
-	args := c.RemainingArgs()
-	if len(args) == 0 {
-		return c.ArgErr()
-	}
-
-	for _, arg := range args {
-		ir.banSearchParams = append(ir.banSearchParams, arg)
-	}
-	return nil
-}
-
-func parseSanctionHostsFile(ir *IranResolver, c *caddyfile.Dispenser) error {
+func parseDnsTimeout(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 	if !c.NextArg() {
 		return c.ArgErr()
 	}
-	v := c.Val()
-	if len(v) < 2 || !filepath.IsAbs(v) {
-		return errors.New("sanction-hosts-file only accepts absolut path!")
+
+	timeoutSeconds, err := strconv.Atoi(c.Val())
+	if err != nil {
+		return errors.Errorf("dns-timeout: invalid timeout value '%s', must be an integer (seconds)", c.Val())
 	}
-	if v == ir.banHostsFile || v == ir.resultHostsFile {
-		return errors.New("should not be the same as ban-hosts-file or result-hosts-file!")
+
+	if timeoutSeconds <= 0 {
+		return errors.New("dns-timeout must be greater than 0 seconds")
 	}
-	ir.sanctionHostsFile = v
+
+	if timeoutSeconds > 300 {
+		return errors.New("dns-timeout too large (max 300 seconds / 5 minutes)")
+	}
+
+	bw.dnsTimeout = time.Duration(timeoutSeconds) * time.Second
+
+	// Update the DNS client with new timeout
+	bw.dnsClient = &dns.Client{
+		Timeout:      bw.dnsTimeout,
+		ReadTimeout:  bw.dnsTimeout,
+		WriteTimeout: bw.dnsTimeout,
+	}
+
 	return nil
 }
 
-func parseBanHostsFile(ir *IranResolver, c *caddyfile.Dispenser) error {
-	if !c.NextArg() {
-		return c.ArgErr()
-	}
-	v := c.Val()
-	if len(v) < 2 || !filepath.IsAbs(v) {
-		return errors.New("ban-hosts-file only accepts absolut path!")
-	}
-	if v == ir.sanctionHostsFile || v == ir.resultHostsFile {
-		return errors.New("should not be the same as sanction-hosts-file or result-hosts-file!")
-	}
-	ir.banHostsFile = v
-	return nil
-}
-
-func parseResultHostsFile(ir *IranResolver, c *caddyfile.Dispenser) error {
-	if !c.NextArg() {
-		return c.ArgErr()
-	}
-	v := c.Val()
-	if len(v) < 2 || !filepath.IsAbs(v) {
-		return errors.New("result-hosts-file only accepts absolut path!")
-	}
-	if v == ir.sanctionHostsFile || v == ir.banHostsFile {
-		return errors.New("should not be the same as sanction-hosts-file or ban-hosts-file!")
-	}
-	ir.resultHostsFile = v
-	return nil
-}
-
-func parseSanctionDestServers(ir *IranResolver, c *caddyfile.Dispenser) error {
+func parseSanctionSearch(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 	args := c.RemainingArgs()
 	if len(args) == 0 {
-		return c.ArgErr()
+		return errors.New("sanction-search requires at least one search parameter")
 	}
 
 	for _, arg := range args {
-		ip := net.ParseIP(arg)
-		if ip == nil {
-			return errors.New("sanction-dest-server-ips must be a list of valid ip addresses!")
+		if arg == "" {
+			return errors.New("sanction-search: empty search parameter")
 		}
-		ir.sanctionDestServers = append(ir.sanctionDestServers, ip)
+		if len(arg) > 255 {
+			return errors.New("sanction-search: parameter too long (max 255 characters)")
+		}
+		bw.sanctionSearchParams = append(bw.sanctionSearchParams, arg)
 	}
 	return nil
 }
 
-func parseBanDestServers(ir *IranResolver, c *caddyfile.Dispenser) error {
+func parseBanSearch(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 	args := c.RemainingArgs()
 	if len(args) == 0 {
-		return c.ArgErr()
+		return errors.New("ban-search requires at least one search parameter")
 	}
 
 	for _, arg := range args {
-		ip := net.ParseIP(arg)
-		if ip == nil {
-			return errors.New("ban-dest-server-ips must be a list of valid ip addresses!")
+		if arg == "" {
+			return errors.New("ban-search: empty search parameter")
 		}
-		ir.banDestServers = append(ir.banDestServers, ip)
+		if len(arg) > 255 {
+			return errors.New("ban-search: parameter too long (max 255 characters)")
+		}
+		bw.banSearchParams = append(bw.banSearchParams, arg)
 	}
 	return nil
 }
 
-func parseSanctionListBufferSize(ir *IranResolver, c *caddyfile.Dispenser) error {
+func parseSanctionListBufferSize(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 	var err error
-	ir.sanctionListBufferSize, err = parsePositiveInt(c)
+	bw.sanctionListBufferSize, err = parsePositiveInt(c)
 	return err
 }
 
-func parseBanListBufferSize(ir *IranResolver, c *caddyfile.Dispenser) error {
+func parseBanListBufferSize(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 	var err error
-	ir.banListBufferSize, err = parsePositiveInt(c)
+	bw.banListBufferSize, err = parsePositiveInt(c)
 	return err
+}
+
+func parseLogLevel(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	level := strings.ToLower(c.Val())
+
+	switch level {
+	case "debug":
+		bw.logger.SetLevel(logrus.DebugLevel)
+	case "info":
+		bw.logger.SetLevel(logrus.InfoLevel)
+	case "warn", "warning":
+		bw.logger.SetLevel(logrus.WarnLevel)
+	case "error":
+		bw.logger.SetLevel(logrus.ErrorLevel)
+	case "fatal":
+		bw.logger.SetLevel(logrus.FatalLevel)
+	default:
+		return errors.Errorf("invalid log level: %s (valid: debug, info, warn, error, fatal)", level)
+	}
+
+	bw.logLevel = level
+	return nil
+}
+
+func parsePgHost(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.pgHost = c.Val()
+	return nil
+}
+
+func parsePgPort(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	var err error
+	bw.pgPort, err = parsePositiveInt(c)
+	return err
+}
+
+func parsePgUser(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.pgUser = c.Val()
+	return nil
+}
+
+func parsePgPassword(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.pgPassword = c.Val()
+	return nil
+}
+
+func parsePgDB(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.pgDB = c.Val()
+	return nil
+}
+
+func parsePgSchema(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.pgSchema = c.Val()
+	return nil
+}
+
+func parsePgSSL(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	val := strings.ToLower(c.Val())
+	if val == "true" {
+		bw.pgSSL = true
+	} else if val == "false" {
+		bw.pgSSL = false
+	} else {
+		return errors.New("pg-ssl must be either true or false")
+	}
+	return nil
+}
+
+func parsePgSSLMode(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.pgSSLMode = c.Val()
+	return nil
+}
+
+func parsePgSSLRootCert(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	v := c.Val()
+	if len(v) < 2 || !filepath.IsAbs(v) {
+		return errors.New("pg-ssl-root-cert only accepts absolute path!")
+	}
+	bw.pgSSLRootCert = v
+	return nil
+}
+
+func parseAdditionalTags(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	args := c.RemainingArgs()
+	if len(args) == 0 {
+		return c.ArgErr()
+	}
+
+	if bw.additionalTags == nil {
+		bw.additionalTags = make(map[string]string)
+	}
+
+	for _, arg := range args {
+		parts := strings.SplitN(arg, "=", 2)
+		if len(parts) != 2 {
+			return errors.Errorf("invalid additional-tag %q, expected key=value", arg)
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		if key == "" {
+			return errors.Errorf("invalid additional-tag %q: empty key", arg)
+		}
+		bw.additionalTags[key] = val
+	}
+	return nil
+}
+
+func parseBanTag(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.banTag = c.Val()
+	return nil
+}
+
+func parseSanctionTag(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
+	if !c.NextArg() {
+		return c.ArgErr()
+	}
+	bw.sanctionTag = c.Val()
+	return nil
 }
 
 func parsePositiveInt(c *caddyfile.Dispenser) (int, error) {
@@ -276,88 +413,11 @@ func parsePositiveInt(c *caddyfile.Dispenser) (int, error) {
 	if err != nil {
 		return -1, c.ArgErr()
 	}
-	if num < 0 {
-		return -1, c.ArgErr()
+	if num <= 0 {
+		return -1, errors.New("value must be greater than 0")
+	}
+	if num > 100000 {
+		return -1, errors.New("value too large (max 100000)")
 	}
 	return num, nil
-}
-
-func initHostFile(path string, welcomeSentence string) error {
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		title := []byte("\n\n# " + welcomeSentence + " \n")
-		err = os.WriteFile(path, title, 0644)
-		if err != nil {
-			return errors.New("couldn't create hosts file")
-		}
-	}
-	return nil
-}
-
-func updateHostsFileWithIps(path string, ips []net.IP) error {
-	hostsList, err := getHostsFromFile(path)
-	if err != nil {
-		return err
-	}
-
-	hostsList = removeDuplicates(hostsList)
-
-	err = removeNonCommentLines(path)
-	if err != nil {
-		return err
-	}
-
-	newContent := ""
-
-	for _, s := range hostsList {
-		for _, ip := range ips {
-			newLine := ip.String() + "    " + s
-			newContent += newLine + "\n"
-		}
-	}
-
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-
-	_, err = f.WriteString(newContent)
-	if err != nil {
-		return err
-	}
-
-	err = f.Close()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func getHostsFromFile(filename string) ([]string, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	var firstElements []string
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "#") {
-			continue // Ignore lines starting with #
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) > 0 {
-			firstElements = append(firstElements, fields[1])
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return firstElements, nil
 }
