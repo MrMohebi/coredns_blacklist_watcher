@@ -42,7 +42,7 @@ func setup(c *caddy.Controller) error {
 	}
 
 	// check required params
-	if len(bw.pgHost) < 1 || len(bw.pgUser) < 1 || len(bw.dns2check) < 1 {
+	if len(bw.dns2check) < 1 {
 		return plugin.Error("blacklist_watcher", errors.New("dns-to-check is required!"))
 	}
 
@@ -265,15 +265,15 @@ func parseLogLevel(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 
 	switch level {
 	case "debug":
-		bw.logger.SetLevel(logrus.DebugLevel)
+		bw.logger.Logger.SetLevel(logrus.DebugLevel)
 	case "info":
-		bw.logger.SetLevel(logrus.InfoLevel)
+		bw.logger.Logger.SetLevel(logrus.InfoLevel)
 	case "warn", "warning":
-		bw.logger.SetLevel(logrus.WarnLevel)
+		bw.logger.Logger.SetLevel(logrus.WarnLevel)
 	case "error":
-		bw.logger.SetLevel(logrus.ErrorLevel)
+		bw.logger.Logger.SetLevel(logrus.ErrorLevel)
 	case "fatal":
-		bw.logger.SetLevel(logrus.FatalLevel)
+		bw.logger.Logger.SetLevel(logrus.FatalLevel)
 	default:
 		return errors.Errorf("invalid log level: %s (valid: debug, info, warn, error, fatal)", level)
 	}

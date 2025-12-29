@@ -45,7 +45,7 @@ type BlacklistWatcher struct {
 	banListBufferSize      int
 	sanctionListBufferSize int
 
-	logger   *logrus.Logger
+	logger   *logrus.Entry
 	logLevel string
 
 	// DNS query timeout in seconds
@@ -61,11 +61,14 @@ type BlacklistWatcher struct {
 }
 
 func New() *BlacklistWatcher {
-	logger := logrus.New()
-	logger.SetFormatter(&logrus.TextFormatter{
+	baseLogger := logrus.New()
+	baseLogger.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
 	})
-	logger.SetLevel(logrus.InfoLevel)
+	baseLogger.SetLevel(logrus.InfoLevel)
+
+	// Create logger entry with plugin name as default field
+	logger := baseLogger.WithField("plugin", "blacklist_watcher")
 
 	// Default DNS timeout: 5 seconds
 	dnsTimeout := 5 * time.Second
@@ -483,6 +486,7 @@ func (bw *BlacklistWatcher) createTableIfNotExists() error {
 			id SERIAL PRIMARY KEY,
 			domain VARCHAR(255) UNIQUE NOT NULL,
 			tags JSONB,
+		    comment TEXT,
 			detected_at TIMESTAMP NOT NULL DEFAULT NOW(),
 			created_at TIMESTAMP NOT NULL DEFAULT NOW()
 		);
