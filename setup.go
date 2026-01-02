@@ -352,7 +352,7 @@ func parsePgSSLRootCert(bw *BlacklistWatcher, c *caddyfile.Dispenser) error {
 		return c.ArgErr()
 	}
 	v := c.Val()
-	if (bw.pgSSLMode == "verify-ca" || bw.pgSSLMode == "verify-full") && (len(bw.pgSSLRootCert) < 1 || !filepath.IsAbs(v)) {
+	if (bw.pgSSLMode == "verify-ca" || bw.pgSSLMode == "verify-full") && (len(v) < 1 || !filepath.IsAbs(v)) {
 		return errors.New("pg-ssl-root-cert must be an absolute path when pg-ssl-mode is verify-ca or verify-full!")
 	}
 	bw.pgSSLRootCert = v
