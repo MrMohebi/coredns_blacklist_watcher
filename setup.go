@@ -73,13 +73,9 @@ func (bw *BlacklistWatcher) OnStartup() (err error) {
 
 // OnShutdown stops all configured clients.
 func (bw *BlacklistWatcher) OnShutdown() error {
-	// Close database connection
-	err := bw.closeDBConnection()
-	if err != nil {
-		bw.logger.WithError(err).Error("Failed to close database connection")
-		return err
-	}
-	bw.logger.Info("Database connection closed")
+	// Close database connection pool
+	bw.closeDBConnection()
+	bw.logger.Info("Database connection pool closed")
 	return nil
 }
 

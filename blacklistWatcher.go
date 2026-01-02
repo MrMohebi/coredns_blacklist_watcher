@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/coredns/coredns/plugin"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 	"net"
@@ -20,7 +20,7 @@ type BlacklistWatcher struct {
 	sanctionSearchParams []string
 	banSearchParams      []string
 
-	pgConnection *pgx.Conn
+	pgPool *pgxpool.Pool
 
 	pgHost     string
 	pgPort     int
@@ -287,7 +287,7 @@ func addSanctionToListIfNotExists(bw *BlacklistWatcher, url string) error {
 }
 
 func flushBanListToDB(bw *BlacklistWatcher) error {
-	if bw.pgConnection == nil {
+	if bw.pgPool == nil {
 		return fmt.Errorf("database connection not initialized")
 	}
 
@@ -317,7 +317,7 @@ func flushBanListToDB(bw *BlacklistWatcher) error {
 			continue // Skip empty domains
 		}
 
-		_, err := bw.pgConnection.Exec(ctx, query, domain, tags, time.Now())
+		_, err := bw.pgPool.Exec(ctx, query, domain, tags, time.Now())
 		if err != nil {
 			return fmt.Errorf("failed to insert domain %s: %w", domain, err)
 		}
@@ -333,7 +333,7 @@ func flushBanListToDB(bw *BlacklistWatcher) error {
 }
 
 func flushSanctionListToDB(bw *BlacklistWatcher) error {
-	if bw.pgConnection == nil {
+	if bw.pgPool == nil {
 		return fmt.Errorf("database connection not initialized")
 	}
 
@@ -363,7 +363,7 @@ func flushSanctionListToDB(bw *BlacklistWatcher) error {
 			continue // Skip empty domains
 		}
 
-		_, err := bw.pgConnection.Exec(ctx, query, domain, tags, time.Now())
+		_, err := bw.pgPool.Exec(ctx, query, domain, tags, time.Now())
 		if err != nil {
 			return fmt.Errorf("failed to insert domain %s: %w", domain, err)
 		}
@@ -438,7 +438,7 @@ func (bw *BlacklistWatcher) buildConnectionString() string {
 	return connStr
 }
 
-// initDBConnection initializes the PostgreSQL connection
+// initDBConnection initializes the PostgreSQL connection pool
 func (bw *BlacklistWatcher) initDBConnection() error {
 	// Validate schema name before connecting
 	if err := sanitizeIdentifier(bw.pgSchema); err != nil {
@@ -449,19 +449,19 @@ func (bw *BlacklistWatcher) initDBConnection() error {
 	defer cancel()
 
 	connStr := bw.buildConnectionString()
-	conn, err := pgx.Connect(ctx, connStr)
+	pool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to create connection pool: %w", err)
 	}
 
 	// Test connection
-	err = conn.Ping(ctx)
+	err = pool.Ping(ctx)
 	if err != nil {
-		_ = conn.Close(ctx)
+		pool.Close()
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	bw.pgConnection = conn
+	bw.pgPool = pool
 
 	// Create table if not exists
 	err = bw.createTableIfNotExists()
@@ -469,7 +469,7 @@ func (bw *BlacklistWatcher) initDBConnection() error {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	bw.logger.Info("Successfully connected to PostgreSQL database")
+	bw.logger.Info("Successfully connected to PostgreSQL database (pool)")
 	return nil
 }
 
@@ -494,16 +494,13 @@ func (bw *BlacklistWatcher) createTableIfNotExists() error {
 		CREATE INDEX IF NOT EXISTS idx_domains_tags ON %s.domains USING GIN(tags);
 	`, safeSchema, safeSchema, safeSchema)
 
-	_, err := bw.pgConnection.Exec(ctx, query)
+	_, err := bw.pgPool.Exec(ctx, query)
 	return err
 }
 
-// closeDBConnection closes the PostgreSQL connection
-func (bw *BlacklistWatcher) closeDBConnection() error {
-	if bw.pgConnection != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return bw.pgConnection.Close(ctx)
+// closeDBConnection closes the PostgreSQL connection pool
+func (bw *BlacklistWatcher) closeDBConnection() {
+	if bw.pgPool != nil {
+		bw.pgPool.Close()
 	}
-	return nil
 }
