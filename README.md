@@ -61,6 +61,7 @@ The plugin automatically creates a `domains` table:
 CREATE TABLE domains (
     id SERIAL PRIMARY KEY,
     domain VARCHAR(255) UNIQUE NOT NULL,
+    comment TEXT,
     tags JSONB,  -- {"type": "BAN", "server": "dns1", ...}
     detected_at TIMESTAMP NOT NULL DEFAULT NOW(),
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
